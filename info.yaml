@@ -1,0 +1,48 @@
+project:
+  title:        "2x2 Systolic TPU"
+  author:       "nubavocadofarmer"
+  discord:      ""
+  description:  "2x2 output-stationary systolic matrix engine, int8 and W4A8, INT24 accumulators"
+  language:     "SystemVerilog"
+  clock_hz:     50000000
+
+  tiles: "2x2"
+
+  top_module:  "tt_um_nubavocadofarmer_systolic_tpu"
+
+  source_files:
+    - "tpu_pkg.sv"
+    - "os_pe.sv"
+    - "os_array.sv"
+    - "host_if.sv"
+    - "tt_um_nubavocadofarmer_systolic_tpu.sv"
+
+pinout:
+  ui[0]: "DATA[0]"
+  ui[1]: "DATA[1]"
+  ui[2]: "DATA[2]"
+  ui[3]: "DATA[3]"
+  ui[4]: "DATA[4]"
+  ui[5]: "DATA[5]"
+  ui[6]: "DATA[6]"
+  ui[7]: "DATA[7]"
+
+  uo[0]: "RESULT[0]"
+  uo[1]: "RESULT[1]"
+  uo[2]: "RESULT[2]"
+  uo[3]: "RESULT[3]"
+  uo[4]: "RESULT[4]"
+  uo[5]: "RESULT[5]"
+  uo[6]: "RESULT[6]"
+  uo[7]: "RESULT[7]"
+
+  uio[0]: "CMD[0]"
+  uio[1]: "CMD[1]"
+  uio[2]: "CMD[2]"
+  uio[3]: "VALID"
+  uio[4]: ""
+  uio[5]: ""
+  uio[6]: "OVF"
+  uio[7]: ""
+
+yaml_version: 6

@@ -1,0 +1,65 @@
+# Design log
+
+This is a record of the main design choices in this project, the reasons for them, the problems that came up, and what was changed because of them.
+
+## Goal and limits
+
+The goal was a small matrix-multiply engine for one Tiny Tapeout slot on SkyWater 130 nm (sky130_fd_sc_hd), running at 50 MHz and driven by the RP2040 on the Tiny Tapeout demo board. The first target was a 1×2 slot, which is a 161 × 225.76 µm die with about 34,000 µm² of space for cells. The chip has 8 input pins, 8 output pins and 8 bidirectional pins, so every number it works on has to come in through those pins. There is no room for memory: one flip-flop in this process is about 20 µm² and stores one bit, so even a 1 KB buffer would be several times larger than the whole slot. Because the RP2040 drives the clock, the chip can be stepped one clock at a time from MicroPython for testing, or run at full speed from an RP2040 PIO program.
+
+## Array design
+
+The array is 2×2: four processing elements (PEs), each producing one output C[m][j]. A 3×3 array would need five more PEs at about 7,000 µm² each, which is more than the whole 1×2 slot, so 2×2 was the largest square size worth trying.
+
+The array is output-stationary. Each PE keeps its own running sum, activations move to the right, weights move down, and the four sums are read out at the end. The other common choice, weight-stationary, loads the weights into the array and reuses them many times. That only helps when there is memory on chip to reuse them from. Here every byte is streamed in from the host, so there is nothing to reuse. Output-stationary also means the only state that matters is the four sums, which is exactly what the readout needs, and no partial sums have to be passed between PEs.
+
+In a systolic array, row 1 and column 1 have to start one step later than row 0 and column 0. The chip does this delay itself with one-step registers on row 1's activations and column 1's weights, so the host sends plain, aligned values. A[m][k] meets W[k][j] at PE(m, j) on step k + m + j, so the last product reaches PE(1,1) two steps after the last input. That is why the DRAIN command adds two steps of zeros.
+
+Bias, activation functions, softmax and requantization are done on the host. They need dividers, lookup tables or wide arithmetic, none of which fit, and leaving them out keeps the chip's output to exact integer sums that are easy to check.
+
+## Math
+
+Each PE has two 8 × 5-bit signed multipliers. The 8-bit weight is split into a high half w_H = w[7:4] and a low half w_L = w[3:0]. In int8 mode, w_H is treated as signed and w_L as unsigned, and the PE computes p = 16·(a0·w_H) + a0·w_L, which equals a0·w. In W4A8 mode, the two halves are two separate signed 4-bit weights and the PE computes p = a1·w_H + a0·w_L, so each step covers two positions of the inner dimension. The multipliers take 5-bit inputs because an unsigned 4-bit value needs a fifth bit to stay positive in a signed multiplier. This lets the same multipliers serve both modes, and W4A8 doubles the multiplies per step for only a second activation register and a few muxes.
+
+In W4A8 mode the two products are added together first, and then that sum is added to the accumulator once. Overflow is checked on that single add. If the two products were added to the accumulator one at a time, a large positive product followed by an equal negative one could falsely report an overflow near the top of the range even though the final sum fits. There is a test for exactly that case.
+
+The accumulators are 24 bits, so the largest value is 2²³ − 1 = 8,388,607. The worst product sets how many steps are always safe. In int8 the worst product is (−128)·(−128) = 16,384, and 8,388,607 / 16,384 rounds down to 511 steps. 512 of those products reach exactly 2²³, one past the maximum. In W4A8 the worst step is 2·128·8 = 2,048, which allows 4,095 steps, or 8,190 inputs. Knowing the inputs are never negative does not help much: 127 × 128 = 16,256 still only allows 516 steps. Longer sums are split into pieces separated by CLEAR and added together on the host. An overflow flag stays set once it trips, so the host never uses a result that wrapped around without knowing it.
+
+## Host interface
+
+All inputs are registered. DATA, CMD and VALID are captured on every rising clock edge, and the command runs on the next edge, so the host can send one command every clock and nothing goes straight from the pins into the math. An earlier version had a separate asynchronous strobe pin. It was removed because the RP2040 already controls the clock, so stepping the clock slowly is already a safe fallback and everything stays on one clock.
+
+The array steps automatically when the fourth byte (int8) or sixth byte (W4A8) of a step is pushed, so there is no separate step command. SET_CFG only records the mode. The mode actually changes when CLEAR runs, and CLEAR also empties every register in the array, so data already in the array is never mixed with a new mode. Results are read through a 4-bit read pointer that selects one of 12 result bytes, plus 4 addresses that always read 0. A new byte shows up 2 clock edges after the pointer command. One known edge case: a command sent during the second DRAIN step is dropped. The host is already required to hold VALID low for 2 clocks after DRAIN, so this only matters if the host breaks that rule.
+
+## A removed feature
+
+An early version also had a "precision gate" that looked at a row of attention scores and decided whether the probabilities could be sent as 4-bit values instead of 8-bit ones. It was about 3,500 µm² and was removed. Its decision was based on a ratio of score sizes, and that ratio changes if the same constant is added to every score, while softmax does not. So the gate's answer did not actually say whether the softmax result was peaked. It also depended on the order and scale of the scores, and there was no data to tune its threshold. Removing it also removed a command, two output pins and a lot of tests. The host can still choose W4A8 for a whole layer in software.
+
+## Testing
+
+Verification started with a Python golden model, test/tpu_model.py. It computes the exact product, the 24-bit wrapping accumulator with the overflow flag, the byte order for each step, the chunked schedule for long sums, and the 16 result bytes. test/check_tpu_model.py checks the model itself on small cases that can be worked out by hand and on the overflow limits.
+
+There are four SystemVerilog unit testbenches. tb_os_pe.sv tests all 16,842,752 input combinations of the multiplier in both modes, the overflow limits, the cancelling-products case, and 10,000 random clear, enable and mode cycles. tb_os_array.sv checks every PE's sum and all 16 result bytes after every clock. tb_host_if.sv runs a cycle-by-cycle reference model of the command decoder and staging next to the real one. tb_tpu.sv tests the whole chip through its pins.
+
+The cocotb tests in test/test_tpu.py drive only the pins and compare every result byte and the overflow pin against the golden model. Each test runs twice: once with a steady 50 MHz clock and one command per clock, and once with a randomly stepped clock and random idle clocks with random data on the pins. The tests cover known products, random products with inner dimension 1 to 64 in both modes, both overflow limits, accumulating across several bursts without CLEAR, a 2,000-input sum split into chunks, mode changes, partial steps, back-to-back reads with the pointer wrapping, and reset in the middle of work. Verilator coverage showed every line of RTL was run. The only signals that never changed were output pins tied to constant values.
+
+To check that the tests can actually catch mistakes, bugs were put into the RTL on purpose: a DRAIN that only ran one step, swapped W4A8 rows, and an overflow flag that did not stay set. The first two were caught right away. The overflow bug was not. The overflow test happened to overflow PE(1,1) on the very last DRAIN step, so nothing ran afterwards that could clear the flag. A test was added that keeps adding small values after an overflow, and after that all three bugs were caught.
+
+The formal checks use SymbiYosys. Yosys could not see signals inside submodules from a test wrapper, so each check wraps one module and only looks at its ports. This also kept all formal code out of the RTL. These are full proofs: the overflow flag stays set until a clear, a clear zeroes the accumulators, the overflow flag and the operand registers, every read address returns 0 after a clear, the mode only changes when CLEAR runs or on reset, and the array is cleared exactly on CLEAR or reset. The check that the array never steps on a partly filled step is only checked for 40 clock cycles after reset, not proven for all time, because a full proof would need to see the internal staging counter. Six bugs put in on purpose each made the matching formal check fail.
+
+A few tool problems came up. Yosys 0.33 could not read "import pkg::*;", so the RTL writes out names like tpu_pkg::CMD_PUSH. The host interface testbench failed on its first clock because it checked registers before the first reset, when they are still unknown in simulation; the testbench was fixed, not the RTL. Verilator warned about unused constants in the package, so that one warning is turned off there. There are no warnings turned off in the arithmetic.
+
+## Area
+
+The first area estimate came from Yosys with the sky130 cell library: 25,550 µm², made of four PEs at about 5,460 µm² each, the host interface at about 3,170 µm², and about 530 µm² of glue logic. That is 70% of the 1×2 slot, inside the 80% that the Tiny Tapeout notes say can work.
+
+The real Tiny Tapeout build failed at placement with "[GPL-0301] Utilization 121.113 % exceeds 100%". It had produced 34,997 µm² of cells, 37% more than the estimate. Its synthesis report showed why: the build uses only 175 of the library's 428 cells and leaves out the smallest drive strengths (the _0 and _1 versions), so every gate became a larger _2 cell. The estimate had used _1 cells. The lesson is to estimate area with the same cell list the real build uses.
+
+Making it fit 1×2 by trimming was not realistic. After counting the space the placer reserves around cell pins, about 1,180 µm² of required tap cells, and a practical density of about 80%, the cells would have needed to come down to about 23,100 µm², roughly a third less. Synthesis runs set up like the real build (they came out about 11% low, so the numbers below are scaled up to match) gave about 35,000 µm² for the current design, about 29,000 µm² with W4A8 removed, about 20,000 µm² for a single row of 2 PEs, and about 15,000 µm² for one shared multiply-accumulate unit serving all four sums. Only the last two would fit 1×2. The PEs make up 86% of the area, mostly multipliers and adders, so small changes and area-focused synthesis settings could not remove a third of it.
+
+The decision was to move to a 2×2-tile slot. A single shared multiply-accumulate unit would have kept the same speed, because the pins, not the multipliers, limit how fast data comes in, but it would no longer be a systolic array and all the unit tests and formal checks would have to be redone. A single row would lose half the outputs. The 2×2-tile slot needed no RTL or test changes, at the cost of twice as many tiles. At 2×2 tiles the design uses 41,521 µm² of the 72,565 µm² core, which is 57.2%. That 41,521 µm² is 35,484 µm² of synthesized logic, 4,126 µm² of buffers added to fix timing, 1,297 µm² of tap cells, 603 µm² of clock tree and 10 µm² of antenna diodes. The Tiny Tapeout precheck passed all 15 checks and the gate-level test passed on the final netlist.
+
+## Speed and timing
+
+Throughput is limited by the pins. In int8 a step is 4 multiplies and takes 4 clocks to push, which is about 50 million multiply-accumulates per second at 50 MHz. In W4A8 a step is 8 multiplies and takes 6 clocks, about 67 million per second. If the array could be fed every clock it would do 200 million and 400 million per second, so the array is idle most of the time. This is the cost of having no memory on chip, and it is also why a bigger array would not have made it faster.
+
+Timing results from the final build: hold timing passes in every corner. Setup timing passes in the typical corner (25°C, 1.8 V) with 7.2 ns to spare, and in the fast corner. It fails in the slow corner (slow silicon, 100°C, 1.6 V) by up to 1.54 ns, which means a worst-case chip in worst-case conditions would need to run at about 46 MHz instead of 50 MHz. All 55 failing paths start at the same flip-flop, the mode register, which drives the mode muxes in all four PEs through a large buffer tree. The math paths themselves pass in every corner. The mode only changes when CLEAR runs, and the first real product comes at least 4 clocks later, so in practice this path has plenty of time, but the timing tool checks it as if it could change every clock. Giving each PE its own copy of the mode register would remove these failures.

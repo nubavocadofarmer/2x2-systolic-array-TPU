@@ -1,0 +1,43 @@
+SIM ?= icarus
+FST ?= -fst
+TOPLEVEL_LANG ?= verilog
+SRC_DIR = $(PWD)/../src
+PROJECT_SOURCES = tpu_pkg.sv os_pe.sv os_array.sv host_if.sv tt_um_nubavocadofarmer_systolic_tpu.sv
+
+ifneq ($(GATES),yes)
+
+SIM_BUILD				= sim_build/rtl_$(SIM)
+VERILOG_SOURCES += $(addprefix $(SRC_DIR)/,$(PROJECT_SOURCES))
+
+else
+
+SIM_BUILD				= sim_build/gl
+COMPILE_ARGS    += -DGL_TEST
+COMPILE_ARGS    += -DFUNCTIONAL
+COMPILE_ARGS    += -DUSE_POWER_PINS
+COMPILE_ARGS    += -DSIM
+COMPILE_ARGS    += -DUNIT_DELAY=\#1
+VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v
+VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v
+
+VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
+
+endif
+
+ifeq ($(SIM),icarus)
+COMPILE_ARGS += -g2012
+endif
+ifeq ($(SIM),verilator)
+EXTRA_ARGS += --coverage --timing
+endif
+
+export GATES
+
+COMPILE_ARGS 		+= -I$(SRC_DIR)
+
+VERILOG_SOURCES += $(PWD)/tb.v
+TOPLEVEL = tb
+
+COCOTB_TEST_MODULES = test_tpu
+
+include $(shell cocotb-config --makefiles)/Makefile.sim

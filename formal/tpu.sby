@@ -1,0 +1,34 @@
+[tasks]
+pe
+array
+hif
+staging
+
+[options]
+pe:      mode prove
+array:   mode prove
+hif:     mode prove
+staging: mode bmc
+staging: depth 40
+
+[engines]
+smtbmc
+
+[script]
+pe:      read -formal os_pe.sv fv_os_pe.sv
+pe:      prep -top fv_os_pe
+array:   read -formal os_pe.sv os_array.sv fv_os_array.sv
+array:   prep -top fv_os_array
+hif:     read -formal tpu_pkg.sv host_if.sv fv_host_if.sv
+hif:     prep -top fv_host_if
+staging: read -formal -D CHECK_STAGING tpu_pkg.sv host_if.sv fv_host_if.sv
+staging: prep -top fv_host_if
+
+[files]
+../src/tpu_pkg.sv
+../src/os_pe.sv
+../src/os_array.sv
+../src/host_if.sv
+fv_os_pe.sv
+fv_os_array.sv
+fv_host_if.sv
